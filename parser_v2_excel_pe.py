@@ -4,6 +4,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -40,7 +41,8 @@ SECTORS = {
 }
 
 
-BASE_URL = "https://smart-lab.ru/q/shares_fundamental4/?sector_id%5B%5D={}&field=p_e"
+BASE_URL_YEARS = "https://smart-lab.ru/q/shares_fundamental4/?sector_id%5B%5D={}&field=p_e"
+BASE_URL_LTM = "https://smart-lab.ru/q/shares_fundamental2/?sector_id%5B%5D={}&field=p_e"
 
 
 def parse_float(x):
@@ -51,36 +53,33 @@ def parse_float(x):
         return None
 
 
-from selenium.common.exceptions import TimeoutException
+def safe_sheet_name(name):
+    invalid_chars = ['\\', '/', '*', '?', ':', '[', ']']
+    for ch in invalid_chars:
+        name = name.replace(ch, ' ')
+    return name[:30]
 
 
-def load_sector(driver, sector_id, sector_name):
-    print(f"\nЗагружаем сектор: {sector_name}")
+# -------- P/E по годам --------
+def load_sector_years(driver, sector_id, sector_name):
+    print(f"\nЗагружаем сектор (годы): {sector_name}")
 
-    url = BASE_URL.format(sector_id)
-    driver.get(url)
+    driver.get(BASE_URL_YEARS.format(sector_id))
 
     try:
         table = WebDriverWait(driver, 25).until(
             EC.presence_of_element_located((By.CLASS_NAME, "simple-little-table"))
         )
     except TimeoutException:
-        print("Таблица не найдена — сектор пропущен")
+        print("Таблица не найдена")
         return pd.DataFrame()
 
     rows = table.find_elements(By.TAG_NAME, "tr")
 
-    if len(rows) < 2:
-        print("Нет строк с данными")
-        return pd.DataFrame()
-
-    # Заголовки
     header_cells = rows[0].find_elements(By.TAG_NAME, "th")
     headers = [h.text.strip() for h in header_cells]
 
     year_columns = headers[5:-2]
-
-    print("Годы:", year_columns)
 
     data = []
 
@@ -93,73 +92,122 @@ def load_sector(driver, sector_id, sector_name):
         name = cells[1]
         ticker = cells[2]
 
-        values = []
-        for cell in cells[5:5 + len(year_columns)]:
-            values.append(parse_float(cell))
-
         row_dict = {
             "Название": name,
             "Тикер": ticker,
             "Сектор": sector_name
         }
 
+        values = [parse_float(x) for x in cells[5:5+len(year_columns)]]
+
         for year, val in zip(year_columns, values):
             row_dict[year] = val
 
         data.append(row_dict)
 
-    print("Компаний:", len(data))
     return pd.DataFrame(data)
 
-def safe_sheet_name(name):
-    invalid_chars = ['\\', '/', '*', '?', ':', '[', ']']
-    for ch in invalid_chars:
-        name = name.replace(ch, ' ')
-    return name[:30]  # ограничение Excel
+
+# -------- P/E LTM --------
+def load_sector_pe_ltm(driver, sector_id, sector_name):
+    print(f"Сканируем LTM P/E: {sector_name}")
+
+    driver.get(BASE_URL_LTM.format(sector_id))
+
+    try:
+        table = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "simple-little-table"))
+        )
+    except TimeoutException:
+        return pd.DataFrame()
+
+    rows = table.find_elements(By.TAG_NAME, "tr")
+
+    data = []
+
+    for row in rows[1:]:
+        cells = row.find_elements(By.TAG_NAME, "td")
+
+        if len(cells) < 6:
+            continue
+
+        name = cells[1].text.strip()
+
+        if name in ["Всего:", "Среднее:"]:
+            continue
+
+        ticker = cells[2].text.strip()
+        pe_value = parse_float(cells[5].text.strip())
+
+        if pe_value is None:
+            continue
+
+        # ФИЛЬТР
+        if 0 < pe_value < 15:
+            data.append({
+                "Название": name,
+                "Тикер": ticker,
+                "Сектор": sector_name,
+                "P/E": pe_value
+            })
+
+    return pd.DataFrame(data)
 
 
+# -------- MAIN --------
 def main():
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
 
     output_path = r"C:\Users\Irina\Desktop\pe_all_sectors.xlsx"
 
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    filtered_companies = []
+    sector_data = {}
 
-        for sector_id, sector_name in SECTORS.items():
-            df = load_sector(driver, sector_id, sector_name)
+    # собираем данные
+    for sector_id, sector_name in SECTORS.items():
 
-            if df is not None and not df.empty:
-                sheet_name = safe_sheet_name(sector_name)
-                print("Записываем в Excel:", sector_name)
+        # данные по годам
+        df_years = load_sector_years(driver, sector_id, sector_name)
 
-                # --- расчет среднего по сектору ---
-                year_columns = df.columns[3:]  # первые 3 колонки: Название, Тикер, Сектор
+        if df_years is not None and not df_years.empty:
+            year_columns = df_years.columns[3:]
+            averages = df_years[year_columns].mean(numeric_only=True)
 
-                averages = df[year_columns].mean(numeric_only=True)
+            avg_row = {
+                "Название": "СРЕДНЕЕ ПО СЕКТОРУ",
+                "Тикер": "",
+                "Сектор": sector_name
+            }
 
-                avg_row = {
-                    "Название": "СРЕДНЕЕ ПО СЕКТОРУ",
-                    "Тикер": "",
-                    "Сектор": sector_name
-                }
+            for col in year_columns:
+                avg_row[col] = averages.get(col, None)
 
-                for col in year_columns:
-                    avg_row[col] = averages.get(col, None)   # ВАЖНО: безопасное получение
+            df_years = pd.concat([df_years, pd.DataFrame([avg_row])], ignore_index=True)
+            sector_data[sector_name] = df_years
 
-                df_with_avg = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+        # LTM фильтр
+        df_filtered = load_sector_pe_ltm(driver, sector_id, sector_name)
 
-
-                try:
-                    df_with_avg.to_excel(writer, sheet_name=sheet_name, index=False)
-
-                except Exception as e:
-                    print("Ошибка записи листа:", sector_name, e)
+        if df_filtered is not None and not df_filtered.empty:
+            filtered_companies.append(df_filtered)
 
     driver.quit()
 
-    print("\nГотово ✅")
-    print("Файл сохранён в:", output_path)
+    # -------- запись Excel --------
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 
+        # первая вкладка
+        if filtered_companies:
+            result_df = pd.concat(filtered_companies, ignore_index=True)
+            result_df.to_excel(writer, sheet_name="P_E < 15", index=False)
+
+        # вкладки по секторам
+        for sector_name, df in sector_data.items():
+            sheet_name = safe_sheet_name(sector_name)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print("\nГотово ✅")
+    print("Файл сохранён:", output_path)
 
 
 if __name__ == "__main__":

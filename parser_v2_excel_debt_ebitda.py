@@ -56,7 +56,7 @@ def safe_sheet_name(name):
     invalid_chars = ['\\', '/', '*', '?', ':', '[', ']']
     for ch in invalid_chars:
         name = name.replace(ch, ' ')
-    return name[:30]  # ограничение Excel
+    return name[:30]
 
 
 def load_sector(driver, sector_id, sector_name):
@@ -80,7 +80,6 @@ def load_sector(driver, sector_id, sector_name):
     for row in rows[1:]:
         cells = row.find_elements(By.TAG_NAME, "td")
 
-        # строки "Всего" и "Среднее" обычно имеют меньше колонок
         if len(cells) < 6:
             continue
 
@@ -109,28 +108,51 @@ def main():
 
     output_path = r"C:\Users\Irina\Desktop\debt_ebitda_all_sectors.xlsx"
 
+    # сюда будем собирать компании ниже среднего
+    below_average_rows = []
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
 
+        sector_dfs = {}
+
+        # --- сначала собираем все данные ---
         for sector_id, sector_name in SECTORS.items():
             df = load_sector(driver, sector_id, sector_name)
 
-            if df is not None and not df.empty:
-                sheet_name = safe_sheet_name(sector_name)
-                print("Записываем в Excel:", sector_name)
+            if df is None or df.empty:
+                continue
 
-                # считаем среднее по сектору
-                avg_value = df["Debt/EBITDA"].mean()
+            avg_value = df["Debt/EBITDA"].mean()
 
-                avg_row = {
-                    "Название": "СРЕДНЕЕ ПО СЕКТОРУ",
-                    "Тикер": "",
-                    "Сектор": sector_name,
-                    "Debt/EBITDA": round(avg_value, 2) if pd.notna(avg_value) else None
-                }
+            # добавляем строку среднего в секторный df
+            avg_row = {
+                "Название": "СРЕДНЕЕ ПО СЕКТОРУ",
+                "Тикер": "",
+                "Сектор": sector_name,
+                "Debt/EBITDA": round(avg_value, 2) if pd.notna(avg_value) else None
+            }
 
-                df_with_avg = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+            df_with_avg = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+            sector_dfs[sector_name] = df_with_avg
 
-                df_with_avg.to_excel(writer, sheet_name=sheet_name, index=False)
+            # --- собираем компании ниже среднего ---
+            filtered = df[df["Debt/EBITDA"] < avg_value].copy()
+            filtered["Средний Debt/EBITDA по сектору"] = round(avg_value, 2)
+
+            below_average_rows.append(filtered)
+
+        # --- создаём вкладку ниже среднего ---
+        if below_average_rows:
+            result_df = pd.concat(below_average_rows, ignore_index=True)
+
+            # записываем ПЕРВОЙ вкладкой
+            result_df.to_excel(writer, sheet_name="Ниже среднего", index=False)
+
+        # --- записываем сектора ---
+        for sector_name, df in sector_dfs.items():
+            sheet_name = safe_sheet_name(sector_name)
+            print("Записываем в Excel:", sector_name)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     driver.quit()
 
